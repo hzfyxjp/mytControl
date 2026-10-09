@@ -1,0 +1,4 @@
+PySide6
+httpx
+pydantic>=2
+pytest

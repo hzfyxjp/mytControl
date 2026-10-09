@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# Tests / IDE
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Runtime
+debug_log/
+*.sqlite3
+
+# Local / vendor SDK (large binaries; not part of app source)
+c/
