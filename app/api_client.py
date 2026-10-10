@@ -65,6 +65,17 @@ def boot_status(ip: str, name: str) -> int:
     return int(data.get("bootStatus"))
 
 
+def device_api_is_available(host_ip: str, api_port: int, timeout: float = 2.0) -> bool:
+    """对齐 moyunteng：9082 映射口 TCP 能通则认为 Android 接口已起来、界面可用。"""
+    if not host_ip or not api_port or api_port < 1 or api_port > 65535:
+        return False
+    try:
+        with socket.create_connection((host_ip, int(api_port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def set_s5_proxy(
     host_ip: str,
     instance_index: int,

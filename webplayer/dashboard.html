@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,height=device-height,initial-scale=1">
+  <title>云机投屏工作台</title>
+  <style>
+    *{box-sizing:border-box} html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#f3f6fa;color:#26374d;font:13px Segoe UI,Microsoft YaHei,sans-serif}
+    #root{--left-width:320px;position:relative;display:grid;grid-template-columns:var(--left-width) 6px minmax(0,1fr)!important;width:100%;height:100%;gap:10px;padding:10px}
+    #main{position:relative;z-index:2;min-width:0;background:transparent;border:1px solid #d8e2ee;border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 2px rgba(39,67,103,.05);align-self:center}
+    #main iframe{width:100%;height:100%;border:0;display:none;background:#e8edf4}
+    #main iframe.visible{display:block}
+    #main .empty{color:#718096;text-align:center;padding:24px}
+    #inputLayer{position:absolute;left:0;right:0;top:0;bottom:48px;z-index:5;display:none;touch-action:none;cursor:default}
+    #mainControls{position:absolute;z-index:10;left:0;right:0;bottom:0;height:48px;display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 10px;background:rgba(248,250,252,.96);border-top:1px solid #d8e2ee}
+    #mainControls button{width:38px;height:32px;border:1px solid #cbd8e8;border-radius:6px;background:#fff;color:#35516f;font-size:18px;line-height:1;cursor:pointer}
+    #mainControls button:hover{background:#eef4ff;border-color:#8fb2e8;color:#2563eb}
+    #mainButtons{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+    /* 提示条只在真的有事发生时出现：没有文字就整块隐藏，页面刚打开时不留占位文字。 */
+    #dashboardStatus{position:absolute;z-index:11;left:12px;bottom:56px;padding:7px 12px;background:rgba(255,255,255,.92);border:1px solid #d8e2ee;border-radius:6px;color:#52657b;font-size:12px}
+    #dashboardStatus:empty{display:none}
+    /* 云机名和同步标记放在**底部操作栏的左端**，不压在主画面上：
+       以前贴在主画面左上角，正好盖住云机状态栏的文字（时间/电量那一排），看着很别扭。
+       这里和右边那三个导航按钮同一条 flex 行，长名字用省略号收尾（min-width:0 才收得住）。 */
+    #mainHeader{display:flex;align-items:center;gap:8px;min-width:0;pointer-events:none}
+    /* 主画面自报身份：自动选中和快捷操作的目标都要看得出是哪台云机。 */
+    #mainName{min-width:0;padding:4px 10px;background:rgba(255,255,255,.92);border:1px solid #d8e2ee;border-radius:6px;color:#1f3552;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:auto}
+    #mainName:empty{display:none}
+    /* 同步控制开着时才出现：动一台会带动几台，必须一眼看得到。整行不吃点击（画面上的操作不被挡住），
+       只有在“本机单独操作”这一种状态下才变成可点的“回到同步源”。 */
+    #syncBadge{flex:0 0 auto;padding:4px 10px;background:rgba(37,99,235,.12);border:1px solid #bcd2f7;border-radius:6px;color:#1d4ed8;font-size:12px;font-weight:600;white-space:nowrap;pointer-events:none}
+    #syncBadge:empty{display:none}
+    #syncBadge.action{pointer-events:auto;cursor:pointer;background:rgba(37,99,235,.18);border-color:#8fb2e8}
+    #syncBadge.action:hover{background:rgba(37,99,235,.3)}
+    /* 会跟随同步源的云机：左上角一个箭头标记，和右上角那三个状态点错开。 */
+    .card.sync-target:after{content:'⇉';position:absolute;left:4px;top:4px;z-index:9;width:16px;height:16px;line-height:16px;text-align:center;border-radius:4px;background:rgba(37,99,235,.92);color:#fff;font-size:11px;font-weight:700}
+    /* 同步源自己：换成青色的“源”，切到别的画面后要靠它认出来再点回去。 */
+    .card.sync-source:after{content:'源';position:absolute;left:4px;top:4px;z-index:9;min-width:16px;height:16px;line-height:16px;padding:0 2px;text-align:center;border-radius:4px;background:rgba(13,148,136,.95);color:#fff;font-size:10px;font-weight:700}
+    #splitter{position:relative;z-index:20;background:#d8e2ee;border-radius:4px;cursor:col-resize;touch-action:none}
+    #splitter:after{content:'';position:absolute;left:2px;top:50%;width:2px;height:44px;transform:translateY(-50%);background:#9db4d0;border-radius:2px}
+    #side{position:relative;z-index:2;min-width:0;overflow:auto;background:transparent;border:1px solid #d8e2ee;border-radius:10px;padding:8px;box-shadow:0 1px 2px rgba(39,67,103,.05)}
+    /* 画面大小只调右侧这些云机小画面；拖动条在主界面那一排工具栏里，页面本身不再提供。 */
+    #cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--card-min,140px),var(--card-max,180px)));justify-content:start;align-items:start;gap:8px}
+    /* 卡片画面区必须是透明的"洞"：实时画面/兜底静帧画在另一个图层里，
+       卡片底色一旦不透明就会把画面盖住（看着就是一片空白）。文字区自己带白底。 */
+    .card{position:relative;z-index:6;min-width:0;display:flex;flex-direction:column;background:transparent;border:1px solid #d5dfeb;border-radius:8px;overflow:hidden;cursor:pointer;box-shadow:0 1px 2px rgba(39,67,103,.06)}
+    .card.active{border:2px solid #2563eb;box-shadow:0 0 0 2px #dbeafe}
+    .card .screen{position:relative;width:100%;aspect-ratio:9/16;background:transparent;overflow:hidden}
+    #surfaces{position:absolute;z-index:1;inset:0;pointer-events:none;overflow:hidden}
+    #surfaces iframe{position:absolute;left:0;top:0;width:360px;height:640px;border:0;transform-origin:top left;pointer-events:none;background:#e8edf4}
+    /* 副屏静帧：和实时画面用同一套定位，只有当前主画面才建 iframe。 */
+    #surfaces img.still{position:absolute;left:0;top:0;width:360px;height:640px;object-fit:contain;transform-origin:top left;pointer-events:none;background:#e8edf4}
+    .card.active .screen:before{content:'当前主画面投屏中，再点一下取消';position:absolute;z-index:8;inset:0;display:flex;align-items:center;justify-content:center;padding:8px;color:#2563eb;background:rgba(239,246,255,.9);font-size:12px;font-weight:600;text-align:center}
+    /* 还没出图时给一句说明，而不是留一块看起来像坏了的白板。 */
+    .card .waiting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:11px;pointer-events:none;z-index:2}
+    .card.has-picture .waiting{display:none}
+    .card .meta{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#fff;border-top:1px solid #e8eef5;cursor:default;min-height:30px}
+    .card .cardPick{width:15px;height:15px;margin:0;flex:0 0 auto;cursor:pointer}
+    /* 坑位号：和云机名用不同颜色区分开，一眼看出这张画面属于哪个坑位。 */
+    .card .meta .slot{flex:0 0 auto;padding:0 5px;border-radius:4px;background:#eef2ff;color:#4338ca;font-size:11px;font-weight:700;line-height:16px}
+    .label{flex:1;min-width:0;padding:0;background:none;color:#1f3552;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .state{position:absolute;right:4px;top:4px;width:7px;height:7px;border-radius:50%;background:#94a3b8;z-index:3}.state.ready{background:#22c55e}.state.error{background:#ef4444}
+    .card.error .screen:after{content:'连接中，正在重试';position:absolute;left:5px;right:5px;top:5px;padding:4px 5px;background:rgba(254,242,242,.95);border:1px solid #fecaca;color:#b91c1c;border-radius:5px;font-size:10px;text-align:center;z-index:4}
+  </style>
+</head>
+<body>
+  <div id="root"><section id="main"><div class="empty">正在准备投屏…</div><div id="inputLayer"></div><div id="dashboardStatus"></div><div id="mainControls"><div id="mainHeader"><span id="mainName"></span><span id="syncBadge"></span></div><span id="mainButtons"><button data-command="back" title="返回" aria-label="返回">↩</button><button data-command="home" title="主页" aria-label="主页">⌂</button><button data-command="tasks" title="任务" aria-label="任务">☷</button></span></div></section><div id="splitter" title="拖动调整主画面与云机画面的宽度"></div><aside id="side"><div id="cards"></div></aside><div id="surfaces"></div></div>
+  <script src="dashboard.js?rev=dashboard-v29"></script>
+</body>
+</html>

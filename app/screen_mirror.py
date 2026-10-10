@@ -1,63 +1,227 @@
-"""把官方 WIN 投屏窗口嵌进坑位。五个坑位共用这一处，不按云机建定时器。"""
+"""官方 WebRTC 投屏：本地 webplayer + QWebEngineView。
+
+文档：https://dev.moyunteng.com/docs/NewMYTOS/MYT_ANDROID_webrtctouping
+非桥接端口：TCP = 30000+(index-1)*100+7，UDP = 30000+(index-1)*100+8
+桥接端口：TCP/UDP 均为 10008。
+"""
 
 from __future__ import annotations
 
-import ctypes
 import os
-import subprocess
+import socket
 import sys
-import time
-from ctypes import wintypes
+import threading
 from dataclasses import dataclass
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlencode
 
-from app.config import debug_log_dir, record_message, screen_sdk_dirs
+from PySide6.QtCore import QUrl
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
-EXE_CANDIDATES = (
-    "android_window_silent.exe",
-    "android_window.exe",
-    "android_window_silent_admin.exe",
-    "android_window_admin.exe",
-)
-LAUNCH_TIMEOUT_S = 8.0
+from app.config import app_dir, record_exception, record_message
+from app.models import webrtc_ports
 
-if sys.platform == "win32":
-    _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
-else:
-    _user32 = None
-    _kernel32 = None
+# 官方播放器：postMessage({type:"close"}) / on_play_end → g_player.end()，通知主机停编码
+_DISCONNECT_JS = """
+(function(){
+  try { window.__mytMirrorClosing = true; } catch (e) {}
+  try {
+    if (window.h5_lgair && typeof window.h5_lgair.on_play_end === 'function') {
+      window.h5_lgair.on_play_end({text:'closing'}, 0);
+      return;
+    }
+  } catch (e) {}
+  try { window.postMessage({type:'close'}, '*'); } catch (e) {}
+})();
+"""
 
+# 断线后官方会挂 start.jpg（#lgairad）；主动关闭时打了 __mytMirrorClosing，不算待重连
+_PROBE_WAITING_JS = """
+(function(){
+  try {
+    if (window.__mytMirrorClosing) return 'closing';
+    if (document.getElementById('lgairad')) return 'waiting';
+    return 'ok';
+  } catch (e) { return 'ok'; }
+})();
+"""
 
-@dataclass
-class SdkPaths:
-    exe: Path
-    lgcloud: Path
+STREAM_PROBE_COOLDOWN_S = 5.0
+TIMEOUT_COOLDOWN_S = 15.0
+# 同一拍最多新开几路，避免五路同时 setUrl 抢崩/黑一坑
+_LAUNCH_BUDGET_DEFAULT = 2
+
+__all__ = [
+    "ScreenMirrors",
+    "player_url",
+    "sdk_available",
+    "webrtc_ports",
+    "webplayer_dir",
+]
 
 
 @dataclass
 class MirrorSession:
     slot: int
     device_id: str
-    title: str
-    process: subprocess.Popen
-    started: float
-    hwnd: int = 0
-    log_file: object | None = None
+    host_ip: str
+    tcp_port: int
+    udp_port: int
+    url: str = ""
+
+
+_player_server: ThreadingHTTPServer | None = None
+_player_lock = threading.Lock()
+_player_port = 0
+
+
+def webplayer_dir() -> Path:
+    return app_dir() / "webplayer"
+
+
+def sdk_available() -> bool:
+    root = webplayer_dir()
+    return (root / "play.html").is_file() and (root / "js" / "h5.lgair.wt.all.min-2.2.js").is_file()
+
+
+def player_url(
+    host_ip: str,
+    tcp_port: int,
+    udp_port: int,
+    *,
+    quality: int = 1,
+    width: int = 360,
+    height: int = 640,
+) -> str:
+    """官方 play.html 参数：shost/sport/q/v/rtc_i/rtc_p（对齐客户端 dashboard）。"""
+    base = _ensure_player_server()
+    query = urlencode(
+        {
+            "shost": host_ip,
+            "sport": str(int(tcp_port)),
+            "q": str(int(quality)),
+            "v": "h264",
+            "rtc_i": host_ip,
+            "rtc_p": str(int(udp_port)),
+            "width": str(int(width)),
+            "height": str(int(height)),
+        }
+    )
+    return f"{base}/play.html?{query}"
+
+
+def configure_webrtc_view(view: QWebEngineView) -> None:
+    """每个投屏视图允许局域网 WebRTC，并自动授权媒体权限。"""
+    if view is None or getattr(view, "_myt_webrtc_configured", False):
+        return
+    settings = view.settings()
+    settings.setAttribute(QWebEngineSettings.WebAttribute.WebRTCPublicInterfacesOnly, False)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+    page = view.page()
+
+    def _grant(origin, feature) -> None:
+        page.setFeaturePermission(
+            origin,
+            feature,
+            QWebEnginePage.PermissionPolicy.PermissionGrantedByUser,
+        )
+
+    page.featurePermissionRequested.connect(_grant)
+    view._myt_webrtc_configured = True
+
+
+def _ensure_player_server() -> str:
+    global _player_server, _player_port
+    with _player_lock:
+        if _player_server is not None and _player_port:
+            return f"http://127.0.0.1:{_player_port}"
+        root = webplayer_dir()
+        if not (root / "play.html").is_file():
+            raise FileNotFoundError(f"缺少官方 webplayer: {root}")
+        class _QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                # 启动图等可选资源 404 不刷控制台
+                if len(args) >= 2 and str(args[1]) == "404":
+                    return
+
+        handler = partial(_QuietHandler, directory=str(root))
+
+        class _Server(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        server = _Server(("127.0.0.1", 0), handler)
+        port = int(server.server_address[1])
+        thread = threading.Thread(target=server.serve_forever, name="webplayer-http", daemon=True)
+        thread.start()
+        _player_server = server
+        _player_port = port
+        return f"http://127.0.0.1:{port}"
+
+
+def _tcp_listening(host: str, port: int, timeout: float = 0.35) -> bool:
+    if not host or port < 1 or port > 65535:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 class ScreenMirrors:
     def __init__(self) -> None:
         self._sessions: dict[int, MirrorSession] = {}
-        self._seq = 0
-        self._job = _create_job()
+        self._skipped: dict[int, str] = {}
+        self._cooldown_until: dict[int, float] = {}
+        self._views: dict[int, QWebEngineView] = {}
+        self._launch_budget = _LAUNCH_BUDGET_DEFAULT
+        self._fail_bound: set[int] = set()
 
-    def active_ids(self) -> set[str]:
-        alive: set[str] = set()
-        for session in self._sessions.values():
-            if session.process.poll() is None or session.hwnd:
-                alive.add(session.device_id)
-        return alive
+    def reset_launch_budget(self, n: int = _LAUNCH_BUDGET_DEFAULT) -> None:
+        self._launch_budget = max(1, int(n))
+
+    def forget_skip(self, slot: int) -> None:
+        self._skipped.pop(slot, None)
+        self._cooldown_until.pop(slot, None)
+
+    def has_session(self, slot: int, device_id: str = "") -> bool:
+        session = self._sessions.get(slot)
+        if session is None:
+            return False
+        if device_id and session.device_id != device_id:
+            return False
+        return True
+
+    def invalidate(self, slot: int, *, cooldown_s: float = STREAM_PROBE_COOLDOWN_S) -> None:
+        """页面加载失败 / 渲染进程挂掉后清会话，交给轮询重试。"""
+        import time
+
+        self._sessions.pop(slot, None)
+        if cooldown_s > 0:
+            self._cooldown_until[slot] = time.monotonic() + cooldown_s
+
+    def is_user_skipped(self, slot: int, device_id: str = "") -> bool:
+        skipped = self._skipped.get(slot)
+        if not skipped:
+            return False
+        if device_id and skipped != device_id:
+            return False
+        return True
+
+    def in_cooldown(self, slot: int) -> bool:
+        import time
+
+        until = self._cooldown_until.get(slot, 0.0)
+        if until <= 0:
+            return False
+        if time.monotonic() >= until:
+            self._cooldown_until.pop(slot, None)
+            return False
+        return True
 
     def ensure(
         self,
@@ -65,341 +229,213 @@ class ScreenMirrors:
         device_id: str,
         name: str,
         host_ip: str,
-        video_port: int,
-        control_port: int,
-        parent_hwnd: int,
+        tcp_port: int,
+        udp_port: int,
+        view: QWebEngineView | None,
+        *,
+        force: bool = False,
+        reload: bool = False,
     ) -> str:
-        current = self._sessions.get(slot)
-        if current and current.device_id == device_id and current.process.poll() is None:
-            if current.hwnd:
-                _fit_child(current.hwnd, parent_hwnd)
-            return "embedded" if current.hwnd else "launching"
-        self.stop(slot)
-        sdk = resolve_sdk()
-        if sdk is None:
+        del name  # 官方 URL 不需要标题
+        import time
+
+        if view is None:
+            return "launching"
+        if self._skipped.get(slot) == device_id:
+            return "cancelled"
+        if not force and self.in_cooldown(slot):
+            return "cooldown"
+        if not sdk_available():
             return "missing_sdk"
-        self._seq += 1
-        title = f"MYT{slot}-{self._seq}-{name}"[:80]
-        log_handle = _open_launch_log()
+        current = self._sessions.get(slot)
+        if current and current.device_id != device_id:
+            self.stop(slot)
+            current = None
+        url = player_url(host_ip, int(tcp_port), int(udp_port))
+        same_target = bool(
+            current
+            and current.device_id == device_id
+            and current.host_ip == host_ip
+            and current.tcp_port == int(tcp_port)
+            and current.udp_port == int(udp_port)
+            and current.url == url
+            and self._views.get(slot) is view
+        )
+        # force 清冷却；reload 才允许同地址再 setUrl（重启补投）。普通加载不反复刷。
+        if force:
+            self._cooldown_until.pop(slot, None)
+        if same_target and not reload:
+            return "embedded"
+        if not force and self._launch_budget <= 0:
+            return "launching"
+        if not _tcp_listening(host_ip, int(tcp_port), timeout=0.2):
+            self._cooldown_until[slot] = time.monotonic() + STREAM_PROBE_COOLDOWN_S
+            return "cooldown"
         try:
-            process = subprocess.Popen(
-                [
-                    str(sdk.exe),
-                    "-ip",
-                    host_ip,
-                    "-vport",
-                    str(video_port),
-                    "-cport",
-                    str(control_port),
-                    "-title",
-                    title,
-                    "-path",
-                    str(sdk.lgcloud),
-                ],
-                cwd=str(sdk.exe.parent),
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
-        except OSError as exc:
-            record_message(f"启动投屏失败: {exc}")
-            close = getattr(log_handle, "close", None)
-            if close is not None:
-                close()
-            return "start_failed"
-        _assign_job(self._job, process)
-        self._sessions[slot] = MirrorSession(
+            _ensure_player_server()
+        except Exception:
+            record_exception("启动 webplayer 服务")
+            return "missing_sdk"
+        self._views[slot] = view
+        self._bind_view_failures(slot, view)
+        session = MirrorSession(
             slot=slot,
             device_id=device_id,
-            title=title,
-            process=process,
-            started=time.monotonic(),
-            log_file=log_handle,
+            host_ip=host_ip,
+            tcp_port=int(tcp_port),
+            udp_port=int(udp_port),
+            url=url,
         )
-        return "launching"
+        self._sessions[slot] = session
+        try:
+            configure_webrtc_view(view)
+            if not force:
+                self._launch_budget -= 1
+            view.setUrl(QUrl(url))
+            view.show()
+        except Exception:
+            record_exception("加载 WebRTC 投屏")
+            self._sessions.pop(slot, None)
+            self._cooldown_until[slot] = time.monotonic() + TIMEOUT_COOLDOWN_S
+            return "start_failed"
+        return "embedded"
 
-    def poll(self, parents: dict[int, int]) -> dict[int, str]:
-        updates: dict[int, str] = {}
-        for slot, session in list(self._sessions.items()):
-            parent = parents.get(slot, 0)
-            if session.hwnd:
-                alive = session.process.poll() is None and _is_window(session.hwnd)
-                if not alive:
-                    self._close_session(session)
-                    self._sessions.pop(slot, None)
-                    updates[slot] = "exited"
-                    continue
-                if parent:
-                    _fit_child(session.hwnd, parent)
-                continue
-            hwnd = _find_hwnd(session.title)
-            if hwnd and parent:
-                _embed(hwnd, parent)
-                session.hwnd = hwnd
-                updates[slot] = "embedded"
-                continue
-            if session.process.poll() is not None:
-                record_message(f"投屏进程退出 slot={slot} code={session.process.returncode}")
-                self._close_session(session)
-                self._sessions.pop(slot, None)
-                updates[slot] = "exited"
-                continue
-            if time.monotonic() - session.started > LAUNCH_TIMEOUT_S:
-                record_message(f"投屏窗口超时 slot={slot} title={session.title}")
-                self.stop(slot)
-                updates[slot] = "timeout"
-        return updates
+    def _bind_view_failures(self, slot: int, view: QWebEngineView) -> None:
+        if getattr(view, "_myt_fail_bound", False):
+            return
+        page = view.page()
 
-    def stop(self, slot: int) -> None:
-        session = self._sessions.pop(slot, None)
-        if session is not None:
-            self._close_session(session)
+        def _on_load(ok: bool, slot=slot, view=view) -> None:
+            if ok:
+                return
+            if self._views.get(slot) is not view or slot not in self._sessions:
+                return
+            record_message(f"WebRTC 页面加载失败 slot={slot}，将重试")
+            self.invalidate(slot)
 
-    def stop_all(self) -> None:
-        for slot in list(self._sessions):
-            self.stop(slot)
+        def _on_crash(_status, _code, slot=slot, view=view) -> None:
+            if self._views.get(slot) is not view:
+                return
+            record_message(f"WebRTC 渲染进程异常 slot={slot}，将重试")
+            self.invalidate(slot, cooldown_s=STREAM_PROBE_COOLDOWN_S)
 
-    @staticmethod
-    def _close_session(session: MirrorSession) -> None:
-        if session.process.poll() is None:
-            session.process.terminate()
-        close = getattr(session.log_file, "close", None)
-        if close is not None:
+        try:
+            page.loadFinished.connect(_on_load)
+            page.renderProcessTerminated.connect(_on_crash)
+            view._myt_fail_bound = True
+            self._fail_bound.add(slot)
+        except (TypeError, RuntimeError, AttributeError):
+            return
+
+    def poll(self, _parents: dict[int, int] | None = None) -> dict[int, str]:
+        # 存活由 probe_waiting + 主窗口按「运行中」决定是否重载。
+        return {}
+
+    def probe_waiting(self, slot: int, callback) -> None:
+        """异步探测是否停在等待重试页。callback(slot, 'ok'|'waiting'|'closing'|'none')。"""
+        view = self._views.get(slot)
+        if view is None or slot not in self._sessions:
+            callback(slot, "none")
+            return
+        page = view.page()
+
+        def _done(result, slot=slot) -> None:
+            status = result if result in {"ok", "waiting", "closing"} else "ok"
             try:
-                close()
-            except OSError:
-                pass
+                callback(slot, status)
+            except Exception:
+                record_exception(f"投屏探测回调 slot={slot}")
+
+        try:
+            page.runJavaScript(_PROBE_WAITING_JS, _done)
+        except RuntimeError:
+            callback(slot, "none")
+
+    def stop(self, slot: int, *, disconnect: bool = True) -> None:
+        self._sessions.pop(slot, None)
+        view = self._views.pop(slot, None)
+        if view is None:
+            return
+        try:
+            if disconnect:
+                view.page().runJavaScript(_DISCONNECT_JS)
+            view.setUrl(QUrl("about:blank"))
+        except RuntimeError:
+            pass
+
+    def stop_all(self, *, disconnect: bool = True) -> None:
+        for slot in list(self._sessions):
+            self.stop(slot, disconnect=disconnect)
+
+    def release_for_exit(self) -> None:
+        """退出前断开全部 WebRTC，并干掉本进程拉起的 QtWebEngine 子进程。
+
+        不 join、不等待线程池；只冲几拍事件循环，避免主机侧继续编码占满 CPU。
+        """
+        self.stop_all(disconnect=True)
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is not None:
+                for _ in range(5):
+                    app.processEvents()
+        except Exception:
+            pass
+        kill_child_webengine_processes()
+
+    def mark_cancelled(self, slot: int, device_id: str) -> None:
+        self._skipped[slot] = device_id
+        self._cooldown_until.pop(slot, None)
+        self.stop(slot)
 
 
-_cached_sdk: SdkPaths | None | bool = None
-
-
-def resolve_sdk() -> SdkPaths | None:
-    global _cached_sdk
-    if _cached_sdk is False:
-        return None
-    if isinstance(_cached_sdk, SdkPaths):
-        return _cached_sdk
-    found = None
-    for folder in screen_sdk_dirs():
-        found = find_sdk(folder)
-        if found is not None:
-            break
-    _cached_sdk = found if found is not None else False
-    if found is None:
-        record_message(f"缺少投屏组件: {', '.join(str(folder) for folder in screen_sdk_dirs())}")
-    return found
-
-
-def sdk_available() -> bool:
-    return resolve_sdk() is not None
-
-
-def find_sdk(root: Path) -> SdkPaths | None:
-    if not root.exists():
-        return None
-    found: dict[str, Path] = {}
-    lgcloud: Path | None = None
-    for dirpath, dirnames, filenames in os.walk(root):
-        if len(Path(dirpath).relative_to(root).parts) > 3:
-            dirnames.clear()
-            continue
-        for filename in filenames:
-            lower = filename.lower()
-            if lower in EXE_CANDIDATES and lower not in found:
-                found[lower] = Path(dirpath) / filename
-            if lower == "lgcloud.exe" and lgcloud is None:
-                lgcloud = Path(dirpath) / filename
-    for name in EXE_CANDIDATES:
-        exe = found.get(name)
-        if exe is None:
-            continue
-        cloud = lgcloud or (exe.parent / "LgCloud.exe")
-        return SdkPaths(exe, cloud)
-    return None
-
-
-def _open_launch_log():
-    try:
-        folder = debug_log_dir()
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{time.strftime('%Y-%m-%d')}.log"
-        return path.open("ab", buffering=0)
-    except OSError:
-        return subprocess.DEVNULL
-
-
-def _find_hwnd(title: str) -> int:
-    if _user32 is None or not title:
+def kill_child_webengine_processes() -> int:
+    """结束本进程的子级 QtWebEngineProcess，迫使 ICE/DTLS 立刻掉线。"""
+    if sys.platform != "win32":
         return 0
-    found: list[int] = []
+    import ctypes
+    from ctypes import wintypes
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def callback(hwnd, _lparam):
-        length = _user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, buffer, length + 1)
-        text = buffer.value
-        if text == title or text.startswith(title):
-            found.append(int(hwnd))
-            return False
-        return True
+    th32cs_snapprocess = 0x00000002
+    invalid = wintypes.HANDLE(-1).value
 
-    _user32.EnumWindows(callback, 0)
-    return found[0] if found else 0
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
 
-
-def _embed(hwnd: int, parent: int) -> None:
-    if _user32 is None:
-        return
-    _user32.SetParent(hwnd, parent)
-    style = _get_style(hwnd)
-    style = (style & ~0x00C00000 & ~0x00040000 & ~0x80000000) | 0x40000000 | 0x10000000
-    _set_style(hwnd, style)
-    _fit_child(hwnd, parent)
-
-
-def _fit_child(hwnd: int, parent: int) -> None:
-    if _user32 is None or not hwnd or not parent or not _is_window(hwnd):
-        return
-    rect = wintypes.RECT()
-    _user32.GetClientRect(parent, ctypes.byref(rect))
-    _user32.MoveWindow(hwnd, 0, 0, rect.right - rect.left, rect.bottom - rect.top, True)
-
-
-def _get_style(hwnd: int) -> int:
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        _user32.GetWindowLongPtrW.restype = ctypes.c_void_p
-        _user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-        return int(_user32.GetWindowLongPtrW(hwnd, -16) or 0)
-    return int(_user32.GetWindowLongW(hwnd, -16) or 0)
-
-
-def _set_style(hwnd: int, style: int) -> None:
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        _user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-        _user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        _user32.SetWindowLongPtrW(hwnd, -16, ctypes.c_void_p(style))
-        return
-    _user32.SetWindowLongW(hwnd, -16, style)
-
-
-def _is_window(hwnd: int) -> bool:
-    if _user32 is None or not hwnd:
-        return False
+    kernel32 = ctypes.windll.kernel32
+    snap = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+    if snap == invalid:
+        return 0
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    parent = os.getpid()
+    killed = 0
     try:
-        return bool(_user32.IsWindow(hwnd))
-    except (OSError, AttributeError):
-        return False
-
-
-def _configure_win32() -> None:
-    if _user32 is None:
-        return
-    _user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-    _user32.SetParent.restype = wintypes.HWND
-    _user32.MoveWindow.argtypes = [
-        wintypes.HWND,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.BOOL,
-    ]
-    _user32.MoveWindow.restype = wintypes.BOOL
-    _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-    _user32.GetClientRect.restype = wintypes.BOOL
-    _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    _user32.GetWindowTextLengthW.restype = ctypes.c_int
-    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    _user32.GetWindowTextW.restype = ctypes.c_int
-    _user32.IsWindow.argtypes = [wintypes.HWND]
-    _user32.IsWindow.restype = wintypes.BOOL
-    if _kernel32 is None:
-        return
-    _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    _kernel32.SetInformationJobObject.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    ]
-    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
-    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-
-
-def _create_job():
-    if _kernel32 is None:
-        return None
-    try:
-        job = _kernel32.CreateJobObjectW(None, None)
-        if not job:
-            return None
-        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = 0x2000
-        ok = _kernel32.SetInformationJobObject(
-            job,
-            9,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        if not ok:
-            return None
-        return job
-    except (OSError, AttributeError):
-        return None
-
-
-def _assign_job(job, process: subprocess.Popen) -> None:
-    if _kernel32 is None or not job:
-        return
-    handle = getattr(process, "_handle", None)
-    if not handle:
-        return
-    try:
-        _kernel32.AssignProcessToJobObject(job, handle)
-    except (OSError, AttributeError):
-        return
-
-
-class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_int64),
-        ("PerJobUserTimeLimit", ctypes.c_int64),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class IO_COUNTERS(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_uint64),
-        ("WriteOperationCount", ctypes.c_uint64),
-        ("OtherOperationCount", ctypes.c_uint64),
-        ("ReadTransferCount", ctypes.c_uint64),
-        ("WriteTransferCount", ctypes.c_uint64),
-        ("OtherTransferCount", ctypes.c_uint64),
-    ]
-
-
-class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ("IoInfo", IO_COUNTERS),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-_configure_win32()
+        more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while more:
+            name = (entry.szExeFile or "").lower()
+            if (
+                int(entry.th32ParentProcessID) == parent
+                and "qtwebengineprocess" in name
+            ):
+                handle = kernel32.OpenProcess(0x0001, False, int(entry.th32ProcessID))
+                if handle:
+                    if kernel32.TerminateProcess(handle, 1):
+                        killed += 1
+                    kernel32.CloseHandle(handle)
+            more = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return killed

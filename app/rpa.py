@@ -1,4 +1,4 @@
-"""云机 RPA：经主机 9082 映射口 /modifydev 执行 shell、dump、点击、滑动、输入。"""
+"""云机 RPA：点击/滑动/按键/落字/shell/dump 走主机 :8000 /rpa/*。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from urllib.parse import unquote
 
 import httpx
+
+from app.config import API_PORT
 
 DUMP_PATH = "/sdcard/uidump.xml"
 BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
@@ -43,7 +45,7 @@ def parse_bounds(raw: str) -> tuple[int, int, int, int] | None:
 
 
 def parse_ui_dump(xml_text: str) -> list[UiNode]:
-    text = (xml_text or "").strip()
+    text = (xml_text or "").replace("\x00", "").strip()
     if not text:
         return []
     # uiautomator dump 有时带无关前缀
@@ -144,18 +146,25 @@ def sleep_with_stop(stop_event: threading.Event | None, seconds: float) -> None:
 
 
 class DeviceRpa:
-    """对单台云机的 RPA 会话（主机 IP + 9082 映射端口）。"""
+    """对单台云机的 RPA 会话（主机 :8000 /rpa/*，需云机名）。
+
+    api_port 已不再用于 RPA（历史参数，可传 0）。
+    """
 
     def __init__(
         self,
         host_ip: str,
-        api_port: int,
+        api_port: int = 0,
         stop_event: threading.Event | None = None,
         timeout: float = 20.0,
         poll_interval: float = 0.2,
+        device_name: str = "",
+        host_api_port: int = API_PORT,
     ) -> None:
         self.host_ip = host_ip
-        self.api_port = int(api_port)
+        self.api_port = int(api_port or 0)  # 兼容旧调用，RPA 不用
+        self.device_name = (device_name or "").strip()
+        self.host_api_port = int(host_api_port or API_PORT)
         self.stop_event = stop_event
         self.timeout = timeout
         self.poll_interval = max(0.05, float(poll_interval))
@@ -164,39 +173,44 @@ class DeviceRpa:
         if self.stop_event is not None and self.stop_event.is_set():
             raise RpaError("已停止")
 
-    def _modifydev(self, data: dict, method: str = "POST") -> dict:
+    def _require_name(self) -> str:
+        if not self.device_name:
+            raise RpaError("缺少云机名，无法调用官方 /rpa 接口")
+        return self.device_name
+
+    def _host_rpa(self, path: str, body: dict) -> dict:
+        """POST http://{host}:8000/rpa/..."""
         self._check_stop()
-        url = f"http://{self.host_ip}:{self.api_port}/modifydev"
+        url = f"http://{self.host_ip}:{self.host_api_port}{path}"
         try:
             with httpx.Client(
                 timeout=httpx.Timeout(self.timeout, connect=3.0),
                 trust_env=False,
             ) as client:
-                if method.upper() == "GET":
-                    response = client.get(url, params=data)
-                else:
-                    response = client.post(url, data=data)
+                response = client.post(url, json=body)
         except httpx.HTTPError as exc:
-            raise RpaError(f"{exc} (目标 {self.host_ip}:{self.api_port})") from exc
+            raise RpaError(f"{exc} ({path} {self.host_ip}:{self.host_api_port})") from exc
         if response.status_code >= 400:
-            raise RpaError(f"HTTP {response.status_code} (目标 {self.host_ip}:{self.api_port})")
+            raise RpaError(
+                f"{path} HTTP {response.status_code} ({self.host_ip}:{self.host_api_port})"
+            )
         if not response.content:
             return {}
         try:
             payload = response.json()
-        except ValueError:
-            return {"raw": response.text}
+        except ValueError as exc:
+            raise RpaError(f"{path} 返回非 JSON") from exc
         if not isinstance(payload, dict):
-            return {"raw": payload}
+            raise RpaError(f"{path} 返回格式错误")
         code = payload.get("code")
         if code not in (200, "200", 0, "0", None):
             raise RpaError(
                 str(
-                    payload.get("msg")
-                    or payload.get("message")
+                    payload.get("message")
+                    or payload.get("msg")
                     or payload.get("error")
                     or payload.get("reason")
-                    or "modifydev 失败"
+                    or f"{path} 失败"
                 )
             )
         return payload
@@ -224,24 +238,12 @@ class DeviceRpa:
             return text
         return ""
 
-    def shell(self, cmdline: str) -> str:
-        payload = self._modifydev({"cmd": 6, "cmdline": cmdline}, method="POST")
-        return self._decode_ret(payload)
-
-    def download_file(self, remote_path: str) -> str:
-        self._check_stop()
-        url = f"http://{self.host_ip}:{self.api_port}/download"
-        try:
-            with httpx.Client(
-                timeout=httpx.Timeout(self.timeout, connect=3.0),
-                trust_env=False,
-            ) as client:
-                response = client.get(url, params={"path": remote_path})
-        except httpx.HTTPError as exc:
-            raise RpaError(f"{exc} (下载 {remote_path})") from exc
-        if response.status_code >= 400:
-            raise RpaError(f"下载失败 HTTP {response.status_code}: {remote_path}")
-        return response.text
+    def shell(self, cmdline: str, timeout: int | None = None) -> str:
+        body: dict = {"name": self._require_name(), "cmd": cmdline or ""}
+        if timeout is not None:
+            body["timeout"] = int(timeout)
+        payload = self._host_rpa("/rpa/shell", body)
+        return self._decode_ret(payload).replace("\x00", "")
 
     def sleep(self, seconds: float) -> None:
         sleep_with_stop(self.stop_event, seconds)
@@ -250,31 +252,81 @@ class DeviceRpa:
         self.shell(deep_link_cmd(uri, package))
 
     def tap(self, x: int, y: int) -> None:
-        self.shell(f"input tap {int(x)} {int(y)}")
+        self._host_rpa(
+            "/rpa/click",
+            {"name": self._require_name(), "x": int(x), "y": int(y)},
+        )
 
-    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
-        self.shell(
-            f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration_ms)}"
+    def swipe(
+        self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300
+    ) -> None:
+        self._host_rpa(
+            "/rpa/swipe",
+            {
+                "name": self._require_name(),
+                "x1": int(x1),
+                "y1": int(y1),
+                "x2": int(x2),
+                "y2": int(y2),
+                "duration": int(duration_ms),
+            },
         )
 
     def keyevent(self, code: int) -> None:
-        self.shell(f"input keyevent {int(code)}")
+        self._host_rpa(
+            "/rpa/key",
+            {"name": self._require_name(), "code": int(code)},
+        )
 
     def back(self) -> None:
+        """KEYCODE_BACK。"""
         self.keyevent(4)
 
+    def home(self) -> None:
+        """KEYCODE_HOME。"""
+        self.keyevent(3)
+
+    def tasks(self) -> None:
+        """KEYCODE_APP_SWITCH：最近任务 / 后台。"""
+        self.keyevent(187)
+
+    def input_text(self, text: str) -> None:
+        """向当前焦点输入框写入文本（支持中文/表情）。"""
+        self._host_rpa(
+            "/rpa/input_text",
+            {"name": self._require_name(), "text": text or ""},
+        )
+
     def dump_nodes(self) -> list[UiNode]:
-        self.shell(f"uiautomator dump {DUMP_PATH}")
-        output = ""
+        # 优先 /rpa/dump_ui（约 0.15s）；失败再用 /rpa/shell + uiautomator（约 3s）
         try:
-            output = self.download_file(DUMP_PATH)
+            return parse_ui_dump(self._dump_ui_xml())
         except RpaError:
-            output = self.shell(f"cat {DUMP_PATH}")
-            if "<hierarchy" not in output and "<node" not in output:
-                output = self.shell(f"toybox cat {DUMP_PATH}")
+            return parse_ui_dump(self._dump_ui_xml_via_shell())
+
+    def _dump_ui_xml(self) -> str:
+        """POST http://{host}:8000/rpa/dump_ui  {"name": 云机名}"""
+        payload = self._host_rpa("/rpa/dump_ui", {"name": self._require_name()})
+        data = payload.get("data")
+        xml_text = ""
+        if isinstance(data, dict):
+            xml_text = str(data.get("xml") or "")
+        elif isinstance(data, str):
+            xml_text = data
+        xml_text = xml_text.replace("\x00", "")
+        if "<hierarchy" not in xml_text and "<node" not in xml_text:
+            raise RpaError("dump_ui XML 为空或不可读")
+        return xml_text
+
+    def _dump_ui_xml_via_shell(self) -> str:
+        """官方 /rpa/shell：uiautomator dump 后 cat 读出 XML。"""
+        self.shell(f"uiautomator dump {DUMP_PATH}")
+        output = self.shell(f"cat {DUMP_PATH}")
+        if "<hierarchy" not in output and "<node" not in output:
+            output = self.shell(f"toybox cat {DUMP_PATH}")
         if "<hierarchy" not in output and "<node" not in output:
             raise RpaError("UI dump 为空或不可读")
-        return parse_ui_dump(output)
+        return output
 
     def find(
         self,
@@ -338,42 +390,11 @@ class DeviceRpa:
         node = self.wait_one(desc=desc, timeout=timeout, **extra)
         self.click_node(node)
 
-    def set_clipboard(self, text: str) -> None:
-        """写入云机剪贴板：GET /clipboard?cmd=2&text=..."""
-        self._check_stop()
-        url = f"http://{self.host_ip}:{self.api_port}/clipboard"
-        try:
-            with httpx.Client(
-                timeout=httpx.Timeout(self.timeout, connect=3.0),
-                trust_env=False,
-            ) as client:
-                response = client.get(url, params={"cmd": 2, "text": text or ""})
-        except httpx.HTTPError as exc:
-            raise RpaError(f"设置剪贴板失败: {exc}") from exc
-        if response.status_code >= 400:
-            raise RpaError(f"设置剪贴板 HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RpaError("剪贴板响应不是 JSON") from exc
-        code = payload.get("code") if isinstance(payload, dict) else None
-        if code not in (200, "200"):
-            raise RpaError(
-                str(payload.get("reason") or payload.get("msg") or "设置剪贴板失败")
-            )
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if isinstance(data, dict) and data.get("status") is False:
-            raise RpaError("设置剪贴板未成功")
-
-    def paste(self) -> None:
-        # KEYCODE_PASTE = 279；部分 ROM 再用 Ctrl+V
-        self.keyevent(279)
-
     def set_text_via_clipboard(self, text: str) -> None:
-        # 不额外 sleep，停留时间由脚本按原 Auto.js 控制
-        self.set_clipboard(text)
-        self.paste()
+        """兼容旧调用：现改为官方 input_text。"""
+        self.input_text(text)
 
     def input_ascii(self, text: str) -> None:
+        """原方案：shell `input text`（经 /rpa/shell）。空格写成 %s。"""
         escaped = (text or "").replace(" ", "%s")
         self.shell(f"input text {escaped}")

@@ -9,12 +9,22 @@ from pathlib import Path
 
 from PySide6.QtCore import QRunnable, QThreadPool
 
-from app.api_client import ApiError, delete_device, list_devices, probe_host, restart_device, set_s5_proxy
+from app.api_client import (
+    ApiError,
+    delete_device,
+    device_api_is_available,
+    list_devices,
+    probe_host,
+    restart_device,
+    set_s5_proxy,
+)
 from app.apk_install import install_named_devices
-from app.config import record_exception
+from app.config import record_exception, record_message
 from app.s5_proxy import S5Proxy
 from app.slots import assign_slots, should_fetch_devices
 from app.script_timing import ScriptTimings
+from app.statuses import RUNNING
+from app.xhs_ext import ScriptContent
 from app.xhs_scripts import SlotScriptCache, run_script
 
 
@@ -26,7 +36,7 @@ class TaskEvent:
 
 def collect_refresh(
     ip: str,
-    _skip_boot_ids: set[str],
+    check_api_names: set[str],
     stop_event: threading.Event,
     epoch: int,
 ) -> TaskEvent | None:
@@ -38,11 +48,19 @@ def collect_refresh(
         return None
     devices = list_devices(ip)
     assigned = assign_slots(devices)
+    need_api = {str(name) for name in check_api_names if name}
     slots: dict[int, dict | None] = {}
     for index, device in assigned.items():
         if stop_event.is_set():
             return None
-        slots[index] = None if device is None else device.slim()
+        if device is None:
+            slots[index] = None
+            continue
+        api_ready = None
+        if device.name in need_api and device.status.lower() == RUNNING and device.s5_api_port:
+            # 对齐 moyunteng._wait_device：运行中且 9082 口通了才算界面可用
+            api_ready = device_api_is_available(ip, int(device.s5_api_port))
+        slots[index] = device.slim(api_ready=api_ready)
     return TaskEvent("devices", {"slots": slots, "epoch": epoch})
 
 
@@ -65,15 +83,32 @@ class TaskService:
         self._lock = threading.Lock()
         self._refresh_running = False
         self._batch_running = False
+        self._batch_count = 0
         self._slot_script_stops: dict[int, threading.Event] = {}
         self._slot_script_busy: set[int] = set()
+        # 导航键：每坑同时只占一个 Worker；连点只保留最新一次
+        self._slot_nav_busy: set[int] = set()
+        self._slot_nav_pending: dict[int, tuple[str, str, int, str]] = {}
         self._slot_caches: dict[int, SlotScriptCache] = {}
         self._script_timings = ScriptTimings()
+        self._script_content = ScriptContent()
         self._timings_lock = threading.Lock()
 
     def set_script_timings(self, timings: ScriptTimings) -> None:
         with self._timings_lock:
             self._script_timings = ScriptTimings.from_dict(timings.to_dict())
+
+    def set_script_content(self, content: ScriptContent | dict | None) -> None:
+        with self._timings_lock:
+            self._script_content = (
+                content
+                if isinstance(content, ScriptContent)
+                else ScriptContent.from_dict(content)
+            )
+
+    def get_script_content(self) -> ScriptContent:
+        with self._timings_lock:
+            return ScriptContent.from_dict(self._script_content.to_dict())
 
     def get_script_timings(self) -> ScriptTimings:
         with self._timings_lock:
@@ -88,6 +123,9 @@ class TaskService:
     def batch_busy(self) -> bool:
         with self._lock:
             return self._batch_running
+
+    def pool_active_count(self) -> int:
+        return int(self._pool.activeThreadCount())
 
     def shutdown(self, fast: bool = True) -> None:
         del fast
@@ -122,11 +160,22 @@ class TaskService:
         self._pool.start(Worker(lambda: self._refresh(ip, set(skip_boot_ids), epoch)))
         return True
 
-    def submit_batch(self, ip: str, action: str, names: list[str], epoch: int) -> bool:
+    def _begin_batch(self) -> bool:
         with self._lock:
-            if self._stop.is_set() or self._batch_running:
+            if self._stop.is_set():
                 return False
+            self._batch_count += 1
             self._batch_running = True
+            return True
+
+    def _end_batch(self) -> None:
+        with self._lock:
+            self._batch_count = max(0, self._batch_count - 1)
+            self._batch_running = self._batch_count > 0
+
+    def submit_batch(self, ip: str, action: str, names: list[str], epoch: int) -> bool:
+        if not self._begin_batch():
+            return False
         self._pool.start(Worker(lambda: self._batch(ip, action, list(names), epoch)))
         return True
 
@@ -139,10 +188,8 @@ class TaskService:
         port: int,
         epoch: int,
     ) -> bool:
-        with self._lock:
-            if self._stop.is_set() or self._batch_running:
-                return False
-            self._batch_running = True
+        if not self._begin_batch():
+            return False
         self._pool.start(
             Worker(
                 lambda: self._install(ip, list(names), apk_path, package_name, port, epoch)
@@ -156,13 +203,88 @@ class TaskService:
         assignments: list[tuple[int, str, int | None, S5Proxy]],
         epoch: int,
     ) -> bool:
-        with self._lock:
-            if self._stop.is_set() or self._batch_running:
-                return False
-            self._batch_running = True
+        if not self._begin_batch():
+            return False
         packed = [(slot, name, api_port, proxy) for slot, name, api_port, proxy in assignments]
         self._pool.start(Worker(lambda: self._set_proxy(ip, packed, epoch)))
         return True
+
+    def submit_slot_nav(
+        self,
+        slot: int,
+        command: str,
+        host_ip: str,
+        api_port: int,
+        device_name: str = "",
+    ) -> bool:
+        """单坑导航键：返回 / 主页 / 后台。每坑同时只占一个 Worker。"""
+        name = (device_name or "").strip()
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            if slot in self._slot_nav_busy:
+                # 已有导航在跑：不另开线程，只覆盖为最新指令
+                self._slot_nav_pending[slot] = (command, host_ip, int(api_port), name)
+                return True
+            self._slot_nav_busy.add(slot)
+            self._slot_nav_pending.pop(slot, None)
+        self._pool.start(
+            Worker(
+                lambda: self._run_slot_nav(
+                    slot, command, host_ip, int(api_port), name
+                )
+            )
+        )
+        return True
+
+    def _run_slot_nav(
+        self,
+        slot: int,
+        command: str,
+        host_ip: str,
+        api_port: int,
+        device_name: str = "",
+    ) -> None:
+        from app.rpa import DeviceRpa
+
+        current = (command, host_ip, int(api_port), (device_name or "").strip())
+        try:
+            while True:
+                cmd, ip, port, name = current
+                try:
+                    client = DeviceRpa(ip, port, device_name=name)
+                    if cmd == "back":
+                        client.back()
+                    elif cmd == "home":
+                        client.home()
+                    elif cmd == "tasks":
+                        client.tasks()
+                    else:
+                        record_message(f"未知导航键 slot={slot} command={cmd}")
+                except Exception:
+                    record_exception(f"坑位导航 slot={slot} command={cmd}")
+                with self._lock:
+                    pending = self._slot_nav_pending.pop(slot, None)
+                    if pending is None:
+                        break
+                    current = pending
+        finally:
+            with self._lock:
+                self._slot_nav_busy.discard(slot)
+                # 收尾瞬间又被点了：再起一个，避免丢最后一次
+                leftover = self._slot_nav_pending.pop(slot, None)
+                restart = leftover is not None and not self._stop.is_set()
+                if restart and leftover is not None:
+                    self._slot_nav_busy.add(slot)
+            if restart and leftover is not None:
+                cmd, ip, port, name = leftover
+                self._pool.start(
+                    Worker(
+                        lambda s=slot, c=cmd, i=ip, p=port, n=name: self._run_slot_nav(
+                            s, c, i, p, n
+                        )
+                    )
+                )
 
     def submit_slot_script(
         self,
@@ -176,6 +298,7 @@ class TaskService:
         with self._lock:
             if self._stop.is_set():
                 return False
+            # 同坑已有脚本：只停旧任务再换新，不并行叠两个同类 Worker 意图
             old = self._slot_script_stops.get(slot)
             if old is not None:
                 old.set()
@@ -211,8 +334,18 @@ class TaskService:
             from app.rpa import sleep_with_stop
 
             timings = self.get_script_timings()
+            script_content = self.get_script_content()
             sleep_with_stop(stop, timings.start_delay)
-            result = run_script(action, host_ip, api_port, stop, cache, timings)
+            result = run_script(
+                action,
+                host_ip,
+                api_port,
+                stop,
+                cache,
+                timings,
+                script_content,
+                device_name=device_name,
+            )
             ok = result.ok
             result_message = result.message
             with self._lock:
@@ -286,8 +419,7 @@ class TaskService:
             record_exception("批量操作")
             failed.append("批量操作失败")
         finally:
-            with self._lock:
-                self._batch_running = False
+            self._end_batch()
             self._emit(
                 TaskEvent(
                     "batch_done",
@@ -320,8 +452,7 @@ class TaskService:
             record_exception("批量安装")
             failed = ["批量安装失败"]
         finally:
-            with self._lock:
-                self._batch_running = False
+            self._end_batch()
             self._emit(
                 TaskEvent(
                     "batch_done",
@@ -366,8 +497,7 @@ class TaskService:
             record_exception("批量设置代理")
             failed.append("批量设置代理失败")
         finally:
-            with self._lock:
-                self._batch_running = False
+            self._end_batch()
             self._emit(
                 TaskEvent(
                     "batch_done",

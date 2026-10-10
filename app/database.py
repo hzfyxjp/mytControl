@@ -99,6 +99,34 @@ class Database:
     def set_s5_ip_pool(self, text: str) -> None:
         self.set_setting("s5_ip_pool", text)
 
+    def get_script_content(self) -> dict[str, str]:
+        """脚本本地文案；原样返回，不 strip（保留表情与空格）。"""
+        return {
+            "comment_content": self.get_setting("script_comment_content", ""),
+            "join_title": self.get_setting("script_join_title", ""),
+            "edit_text": self.get_setting("script_edit_text", ""),
+            "edit_tags": self.get_setting("script_edit_tags", ""),
+        }
+
+    def set_script_content(
+        self,
+        *,
+        comment_content: str | None = None,
+        join_title: str | None = None,
+        edit_text: str | None = None,
+        edit_tags: str | None = None,
+    ) -> None:
+        """写入脚本本地文案；传入 None 的字段不改；不 strip。"""
+        with self._lock:
+            if comment_content is not None:
+                self._set_setting_locked("script_comment_content", comment_content)
+            if join_title is not None:
+                self._set_setting_locked("script_join_title", join_title)
+            if edit_text is not None:
+                self._set_setting_locked("script_edit_text", edit_text)
+            if edit_tags is not None:
+                self._set_setting_locked("script_edit_tags", edit_tags)
+
     def get_apk_path(self) -> str:
         return self.get_setting("apk_path", "").strip()
 

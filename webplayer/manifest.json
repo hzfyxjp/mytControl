@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "entryFile": "play.html",
+  "files": {
+    "play.html": "sha256:aa6fda98b47a349131bd65b3e76da1dcba5fcaec5f8c2839a40f44e91259c6ea",
+    "dashboard.html": "sha256:821e0d02f7684454a25f649343a52648f7274db20672cccee7368f218070c575",
+    "dashboard.js": "sha256:64960c492f678621ca237ac4144320d2c8337ab997a946a552c0c1076c331bef",
+    "js/adapter-latest.js": "sha256:f3ce1561e9ce676e725123e8223f7fd4fa89c93e85a6c411da79bf831b287527",
+    "js/jquery-3.2.1.min.js": "sha256:75b707d8761e2bfbd25fbd661f290a4f7fd11c48e1bf53a36dc6bd8a0034fa35",
+    "js/h5.lgair.wt.all.min-2.2.js": "sha256:43992a69cfe31af4d52aabd7253b134232636b01bc6160c350daea70054d345b",
+    "public/images/108.png": "sha256:2652ddf15cab0b5b5e529d5a9854540c610bbd041d31d34129282ef95991e011",
+    "public/images/loading.png": "sha256:205b9d88154ba5f3cf483786e41f0a2b1e572c4755bf8dcb035ca49555594e5a",
+    "js/unicode-input-compat.js": "sha256:d752b88f39d9929f55e661afe59cf6927ad781af3a4a21591f73bcfc9756fa5a"
+  }
+}

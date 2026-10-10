@@ -24,5 +24,6 @@ dist/
 debug_log/
 *.sqlite3
 
-# Local / vendor SDK (large binaries; not part of app source)
+# Local / vendor SDK (large binaries; not part of app source / not packaged)
 c/
+adb/

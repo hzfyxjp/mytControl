@@ -71,6 +71,167 @@ def test_decode_ret_percent_encoding():
     assert DeviceRpa._decode_ret({"data": "plain"}) == "plain"
 
 
+def test_dump_nodes_uses_host_rpa_dump_ui(monkeypatch):
+    xml = SAMPLE_XML + "\x00"
+    calls: list[tuple] = []
+
+    class _Resp:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {"code": 0, "message": "OK", "data": {"xml": xml}}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            calls.append((url, json))
+            return _Resp()
+
+    monkeypatch.setattr("app.rpa.httpx.Client", _Client)
+    rpa = DeviceRpa("192.168.0.105", 30101, device_name="cloud-a")
+    nodes = rpa.dump_nodes()
+    assert calls == [
+        ("http://192.168.0.105:8000/rpa/dump_ui", {"name": "cloud-a"})
+    ]
+    assert find_nodes(nodes, text="发送")
+
+
+def test_dump_nodes_falls_back_to_rpa_shell(monkeypatch):
+    calls: list[tuple] = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.content = b"{}"
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            calls.append((url, json))
+            if url.endswith("/rpa/dump_ui"):
+                return _Resp({"code": 1, "message": "fail"})
+            cmd = (json or {}).get("cmd") or ""
+            if "uiautomator dump" in cmd:
+                return _Resp({"code": 0, "data": {"output": "UI hierchary dumped to: /sdcard/uidump.xml"}})
+            if "cat " in cmd:
+                return _Resp({"code": 0, "data": {"output": SAMPLE_XML}})
+            return _Resp({"code": 0, "data": {"output": ""}})
+
+    monkeypatch.setattr("app.rpa.httpx.Client", _Client)
+    rpa = DeviceRpa("192.168.0.105", device_name="cloud-a")
+    nodes = rpa.dump_nodes()
+    assert any(url.endswith("/rpa/dump_ui") for url, _ in calls)
+    assert any(url.endswith("/rpa/shell") for url, _ in calls)
+    assert find_nodes(nodes, text="发送")
+
+
+def test_official_click_swipe_key_input(monkeypatch):
+    calls: list[tuple] = []
+
+    class _Resp:
+        status_code = 200
+        content = b'{"code":0}'
+
+        def json(self):
+            return {"code": 0, "message": "OK", "data": {}}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            calls.append((url, json))
+            return _Resp()
+
+    monkeypatch.setattr("app.rpa.httpx.Client", _Client)
+    rpa = DeviceRpa("192.168.0.105", 30101, device_name="cloud-a")
+    rpa.tap(10, 20)
+    rpa.swipe(1, 2, 3, 4, 350)
+    rpa.keyevent(4)
+    rpa.input_text("你好😊")
+    assert calls == [
+        ("http://192.168.0.105:8000/rpa/click", {"name": "cloud-a", "x": 10, "y": 20}),
+        (
+            "http://192.168.0.105:8000/rpa/swipe",
+            {
+                "name": "cloud-a",
+                "x1": 1,
+                "y1": 2,
+                "x2": 3,
+                "y2": 4,
+                "duration": 350,
+            },
+        ),
+        ("http://192.168.0.105:8000/rpa/key", {"name": "cloud-a", "code": 4}),
+        (
+            "http://192.168.0.105:8000/rpa/input_text",
+            {"name": "cloud-a", "text": "你好😊"},
+        ),
+    ]
+
+
+def test_shell_uses_host_rpa(monkeypatch):
+    calls: list[tuple] = []
+
+    class _Resp:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {"code": 0, "data": {"output": "ok%0A\x00", "exitCode": 0}}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            calls.append((url, json))
+            return _Resp()
+
+    monkeypatch.setattr("app.rpa.httpx.Client", _Client)
+    rpa = DeviceRpa("192.168.0.105", device_name="cloud-a")
+    assert rpa.shell("echo ok") == "ok\n"
+    assert calls == [
+        (
+            "http://192.168.0.105:8000/rpa/shell",
+            {"name": "cloud-a", "cmd": "echo ok"},
+        )
+    ]
+
+
 def test_id_match_suffix():
     nodes = parse_ui_dump(
         """<?xml version='1.0'?><hierarchy>

@@ -1,4 +1,4 @@
-"""小红书脚本用的外部 HTTP（取号 / 话术 / 接码）。"""
+"""小红书脚本：取号仍走 HTTP；评论/进群/改收文案改读本地配置。"""
 
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import httpx
 
 DEFAULT_API = "http://8.136.11.82/api.php"
 DEFAULT_ADD = "http://8.136.11.82/add.php"
-DEFAULT_GET = "http://8.136.11.82/get.php"
-DEFAULT_GET2 = "http://8.136.11.82/get2.php"
 
 
 class ExtApiError(Exception):
@@ -21,6 +19,34 @@ class ExtApiError(Exception):
 class PhoneTicket:
     phone: str
     url: str
+
+
+@dataclass(frozen=True)
+class ScriptContent:
+    """应用内配置的脚本文案；字段不 strip，保留表情与空格。"""
+
+    comment_content: str = ""
+    join_title: str = ""
+    edit_text: str = ""
+    edit_tags: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "ScriptContent":
+        raw = data if isinstance(data, dict) else {}
+        return cls(
+            comment_content=str(raw.get("comment_content") or ""),
+            join_title=str(raw.get("join_title") or ""),
+            edit_text=str(raw.get("edit_text") or ""),
+            edit_tags=str(raw.get("edit_tags") or ""),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "comment_content": self.comment_content,
+            "join_title": self.join_title,
+            "edit_text": self.edit_text,
+            "edit_tags": self.edit_tags,
+        }
 
 
 def _get_text(url: str, timeout: float = 20.0) -> str:
@@ -67,14 +93,19 @@ def fetch_sms_body(sms_url: str) -> str:
     return _get_text(sms_url)
 
 
-def fetch_comment_lines(get_url: str = DEFAULT_GET) -> list[str]:
-    payload = _get_json(get_url)
-    content = str(payload.get("content") or "")
-    parts = content.split("|")
+def comment_lines_from_local(content: str) -> list[str]:
+    """评论话术：按 | 分段，不对各段 strip。"""
+    parts = str(content or "").split("|")
     if len(parts) < 3:
-        raise ExtApiError("话术不足 3 段")
+        raise ExtApiError("评论话术不足 3 段（用 | 分隔）")
     return parts
 
 
-def fetch_get2(get2_url: str = DEFAULT_GET2) -> dict:
-    return _get_json(get2_url)
+def get2_from_local(content: ScriptContent | dict | None) -> dict[str, str]:
+    """进群/改收用本地配置；不对 title/text/tags 做 strip。"""
+    cfg = content if isinstance(content, ScriptContent) else ScriptContent.from_dict(content)
+    return {
+        "title": cfg.join_title,
+        "text": cfg.edit_text,
+        "tags": cfg.edit_tags,
+    }

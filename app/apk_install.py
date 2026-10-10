@@ -15,7 +15,6 @@ from pathlib import Path
 from urllib.parse import quote, unquote, unquote_plus
 
 from app.api_client import ApiError, batch_install_apk, task_status
-from app.config import record_message
 
 _CHUNK = 1024 * 1024
 _POLL_SLICE_S = 0.2
@@ -303,7 +302,6 @@ def install_named_devices(
     advertise = reachable_local_ipv4(host_ip)
     server = ensure_apk_server(port)
     apk_url = server.register(path, file_key, advertise)
-    record_message(f"批量安装 {package_name.strip()} {apk_url}")
     response = batch_install_apk(host_ip, [apk_url], list(names))
     task_id = extract_task_id(response)
     if not task_id:
